@@ -1,15 +1,16 @@
-"""核心领域逻辑：训练件登记、同页判定、清单发布与冲突物化。
+"""核心领域逻辑：训练件登记、同页判定、清单发布与冲突派生。
 
 不变量：
 1. scan_components 始终等于 active 同页边的连通分量（传递闭包），
-   按清单号查询时无需重新串联同页判定。
-2. conflicts 始终精确等于「清单内评测件所在分量含训练件」的全部
-   (清单号, 评测件号, 训练件号) 三元组。
-3. 清单供数状态由 conflicts 派生：无冲突 -> 按原编号供出原清单；
+   training_scans.component_id 始终等于该训练件当前所在分量。
+2. 不逐对物化冲突：凭清单号查询时按清单件所在分量直接关联训练登记
+   （JOIN training_scans.component_id），组内其他补扫件不参与取数。
+3. 清单供数状态由上述分组/登记在读取时派生：无冲突 -> 按原编号供出原清单；
    有冲突 -> 暂停供数，凭清单号只返回冲突的评测件号与训练件号。
 
-每个公开写操作都必须包在 db.write_tx 单事务内调用：
-登记/判定变动与供数结论一并生效，任一步失败整体回滚，沿用原状态。
+每个公开写操作都必须包在 db.write_tx 单事务内调用：登记/判定变动与供数结论
+一并生效，任一步失败整体回滚，沿用原状态。写路径只更新受影响的件号（及其
+同页分组成员），不再重写任何逐对冲突记录。
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+
+from .db import ensure_component as _ensure_component
 
 
 class DomainError(Exception):
@@ -59,18 +62,6 @@ def _component_of(conn: sqlite3.Connection, scan_id: str) -> int | None:
     return None if row is None else row["component_id"]
 
 
-def _ensure_component(conn: sqlite3.Connection, scan_id: str) -> int:
-    comp = _component_of(conn, scan_id)
-    if comp is not None:
-        return comp
-    comp = conn.execute("INSERT INTO components DEFAULT VALUES").lastrowid
-    conn.execute(
-        "INSERT INTO scan_components (scan_id, component_id) VALUES (?, ?)",
-        (scan_id, comp),
-    )
-    return comp
-
-
 def _component_members(conn: sqlite3.Connection, component_id: int) -> list[str]:
     return [
         r["scan_id"]
@@ -81,13 +72,33 @@ def _component_members(conn: sqlite3.Connection, component_id: int) -> list[str]
     ]
 
 
-def _merge_components(conn: sqlite3.Connection, c1: int, c2: int) -> int:
-    """合并两个分量，返回保留的分量号。"""
-    keep, drop = min(c1, c2), max(c1, c2)
-    conn.execute(
-        "UPDATE scan_components SET component_id = ? WHERE component_id = ?",
-        (keep, drop),
+def _move_component(
+    conn: sqlite3.Connection, scan_ids: list[str], component_id: int
+) -> None:
+    """把件号及其训练登记一并迁到指定分量（只动受影响的件号）。"""
+    if not scan_ids:
+        return
+    conn.executemany(
+        "UPDATE scan_components SET component_id = ? WHERE scan_id = ?",
+        [(component_id, s) for s in scan_ids],
     )
+    conn.executemany(
+        "UPDATE training_scans SET component_id = ? WHERE scan_id = ?",
+        [(component_id, s) for s in scan_ids],
+    )
+
+
+def _merge_components(conn: sqlite3.Connection, c1: int, c2: int) -> int:
+    """合并两个分量，返回保留的分量号。
+
+    只迁移被并入一侧的成员；保留成员较多的一侧以减少写入量。
+    """
+    members_1 = _component_members(conn, c1)
+    members_2 = _component_members(conn, c2)
+    keep, drop, moving = (
+        (c1, c2, members_2) if len(members_1) >= len(members_2) else (c2, c1, members_1)
+    )
+    _move_component(conn, moving, keep)
     conn.execute("DELETE FROM components WHERE component_id = ?", (drop,))
     return keep
 
@@ -97,8 +108,8 @@ def _split_after_withdrawal(
 ) -> bool:
     """撤回边 (a, b) 后检查原分量是否分裂。
 
-    仅在原分量成员范围内做 BFS；若 a 到 b 不再连通，把 a 所在侧迁往新分量。
-    返回是否发生了分裂。
+    仅在原分量成员范围内做 BFS；若 a 到 b 不再连通，把较小的一侧迁往新分量
+    （较大一侧保留原分量号，写入量最小）。返回是否发生了分裂。
     """
     placeholders = ",".join("?" * len(members))
     edges = conn.execute(
@@ -122,85 +133,47 @@ def _split_after_withdrawal(
     if b in seen:
         return False  # 仍有其他路径相连，分量不变
 
+    other = [s for s in members if s not in seen]
+    moving = list(seen) if len(seen) <= len(other) else other
     new_comp = conn.execute("INSERT INTO components DEFAULT VALUES").lastrowid
-    conn.executemany(
-        "UPDATE scan_components SET component_id = ? WHERE scan_id = ?",
-        [(new_comp, s) for s in seen],
-    )
+    _move_component(conn, moving, new_comp)
     return True
-
-
-# ---------------------------------------------------------------------------
-# 冲突物化
-# ---------------------------------------------------------------------------
-
-def _trainings_in_component(conn: sqlite3.Connection, component_id: int) -> list[str]:
-    return [
-        r["scan_id"]
-        for r in conn.execute(
-            "SELECT t.scan_id FROM training_scans t "
-            "JOIN scan_components c ON c.scan_id = t.scan_id "
-            "WHERE c.component_id = ? ORDER BY t.scan_id",
-            (component_id,),
-        )
-    ]
-
-
-def _recompute_conflicts(conn: sqlite3.Connection, scan_ids: list[str]) -> None:
-    """对受影响的评测件号重建其全部冲突对（先删后插，幂等）。"""
-    scan_ids = list(dict.fromkeys(scan_ids))
-    if not scan_ids:
-        return
-    conn.executemany(
-        "DELETE FROM conflicts WHERE eval_scan_id = ?", [(s,) for s in scan_ids]
-    )
-    for scan_id in scan_ids:
-        comp = _component_of(conn, scan_id)
-        if comp is None:
-            continue
-        trainings = _trainings_in_component(conn, comp)
-        if not trainings:
-            continue
-        manifest_ids = [
-            r["manifest_id"]
-            for r in conn.execute(
-                "SELECT manifest_id FROM manifest_items WHERE scan_id = ?",
-                (scan_id,),
-            )
-        ]
-        conn.executemany(
-            "INSERT OR IGNORE INTO conflicts (manifest_id, eval_scan_id, training_scan_id)"
-            " VALUES (?, ?, ?)",
-            [(m, scan_id, t) for m in manifest_ids for t in trainings],
-        )
 
 
 # ---------------------------------------------------------------------------
 # 训练件登记
 # ---------------------------------------------------------------------------
 
+def _trainings_in_component(conn: sqlite3.Connection, component_id: int) -> list[str]:
+    return [
+        r["scan_id"]
+        for r in conn.execute(
+            "SELECT scan_id FROM training_scans"
+            " WHERE component_id = ? ORDER BY scan_id",
+            (component_id,),
+        )
+    ]
+
+
 def register_training_scan(conn: sqlite3.Connection, scan_id: str) -> bool:
-    """登记曾用于训练的扫描件号。返回是否新登记（重复登记幂等）。"""
+    """登记曾用于训练的扫描件号。返回是否新登记（重复登记幂等）。
+
+    仅写入该件号本身及其分组归属，不触发任何冲突重算。
+    """
     comp = _ensure_component(conn, scan_id)
     cur = conn.execute(
-        "INSERT OR IGNORE INTO training_scans (scan_id, created_at) VALUES (?, ?)",
-        (scan_id, _now()),
+        "INSERT OR IGNORE INTO training_scans (scan_id, component_id, created_at)"
+        " VALUES (?, ?, ?)",
+        (scan_id, comp, _now()),
     )
-    created = cur.rowcount > 0
-    if created:
-        # 该分量内所有评测件都可能新增与它的冲突
-        _recompute_conflicts(conn, _component_members(conn, comp))
-    return created
+    return cur.rowcount > 0
 
 
 def deregister_training_scan(conn: sqlite3.Connection, scan_id: str) -> None:
-    """注销训练件登记（冲突随之消除）。"""
-    comp = _component_of(conn, scan_id)
+    """注销训练件登记（其冲突在读取时自然消失）。"""
     cur = conn.execute("DELETE FROM training_scans WHERE scan_id = ?", (scan_id,))
     if cur.rowcount == 0:
         raise NotFound(f"训练件 {scan_id} 未登记")
-    if comp is not None:
-        _recompute_conflicts(conn, _component_members(conn, comp))
 
 
 def list_training_scans(conn: sqlite3.Connection) -> list[str]:
@@ -246,8 +219,7 @@ def register_same_page(
     comp_a = _ensure_component(conn, scan_a)
     comp_b = _ensure_component(conn, scan_b)
     if comp_a != comp_b:
-        keep = _merge_components(conn, comp_a, comp_b)
-        _recompute_conflicts(conn, _component_members(conn, keep))
+        _merge_components(conn, comp_a, comp_b)
     return True
 
 
@@ -268,9 +240,7 @@ def withdraw_same_page(conn: sqlite3.Connection, evidence_id: str) -> bool:
     comp = _component_of(conn, row["scan_a"])
     if comp is not None:
         members = _component_members(conn, comp)
-        if _split_after_withdrawal(conn, row["scan_a"], row["scan_b"], members):
-            # 分量分裂后，原分量两侧的评测件冲突都可能变化
-            _recompute_conflicts(conn, members)
+        _split_after_withdrawal(conn, row["scan_a"], row["scan_b"], members)
     return True
 
 
@@ -336,7 +306,9 @@ def submit_manifest(conn: sqlite3.Connection, items: list[str]) -> tuple[str, li
 def get_manifest(conn: sqlite3.Connection, manifest_id: str) -> dict | None:
     """凭清单号查询。只读 SELECT，无需重新串联同页判定。
 
-    无冲突：供出原清单；有冲突：暂停供数，只返回冲突的评测件号与训练件号。
+    只取本清单的评测件，按「件号 -> 分量 -> 训练登记」直接关联，
+    不展开组内其他补扫件。无冲突：供出原清单；有冲突：暂停供数，
+    只返回冲突的评测件号与训练件号。
     """
     manifest = conn.execute(
         "SELECT manifest_id FROM manifests WHERE manifest_id = ?", (manifest_id,)
@@ -344,8 +316,12 @@ def get_manifest(conn: sqlite3.Connection, manifest_id: str) -> dict | None:
     if manifest is None:
         return None
     conflicts = conn.execute(
-        "SELECT eval_scan_id, training_scan_id FROM conflicts"
-        " WHERE manifest_id = ? ORDER BY eval_scan_id, training_scan_id",
+        "SELECT mi.scan_id AS eval_scan_id, t.scan_id AS training_scan_id"
+        " FROM manifest_items mi"
+        " JOIN scan_components sc ON sc.scan_id = mi.scan_id"
+        " JOIN training_scans t ON t.component_id = sc.component_id"
+        " WHERE mi.manifest_id = ?"
+        " ORDER BY eval_scan_id, training_scan_id",
         (manifest_id,),
     ).fetchall()
     if conflicts:

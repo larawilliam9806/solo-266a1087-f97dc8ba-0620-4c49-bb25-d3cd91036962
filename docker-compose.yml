@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: ocr-eval-manifest-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/ocr_eval.db
+    volumes:
+      - ocr-eval-data:/data
+    restart: unless-stopped
+
+volumes:
+  ocr-eval-data:
